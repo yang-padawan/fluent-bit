@@ -28,7 +28,8 @@
 /* Default collection time: every 1 second (0 nanoseconds) */
 #define DEFAULT_INTERVAL_SEC    1
 #define DEFAULT_INTERVAL_NSEC   0
-#define IN_CPU_KEY_LEN       16
+#define IN_CPU_KEY_LEN          16
+#define FLB_CMD_LEN             256
 
 struct cpu_key {
     uint8_t length;
@@ -69,12 +70,15 @@ struct cpu_stats {
 /* CPU Input configuration & context */
 struct flb_cpu {
     /* setup */
-    pid_t pid;          /* optional PID */
-    int n_processors;   /* number of core processors  */
-    int cpu_ticks;      /* CPU ticks (Kernel setting) */
-    int coll_fd;        /* collector id/fd            */
-    int interval_sec;   /* interval collection time (Second) */
-    int interval_nsec;  /* interval collection time (Nanosecond) */
+    pid_t pid;              /* optional PID */
+    char* proc_name;        /* optional process name */
+    size_t len_proc_name;   /* process name length */
+    uint8_t alive;          /* process state indicator */
+    int n_processors;       /* number of core processors  */
+    int cpu_ticks;          /* CPU ticks (Kernel setting) */
+    int coll_fd;            /* collector id/fd            */
+    int interval_sec;       /* interval collection time (Second) */
+    int interval_nsec;      /* interval collection time (Nanosecond) */
     struct cpu_stats cstats;
     struct flb_input_instance *ins;
 };

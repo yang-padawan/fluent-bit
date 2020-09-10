@@ -28,6 +28,11 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <math.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <glob.h>
 
 #include <msgpack.h>
 
@@ -79,6 +84,79 @@ static inline void snapshots_switch(struct cpu_stats *cstats)
     else {
         cstats->snap_active = CPU_SNAP_ACTIVE_A;
     }
+}
+
+static int get_pid_status(pid_t pid)
+{
+    int ret =  kill(pid, 0);
+    return ((ret != ESRCH)  && (ret != EPERM) && (ret != ESRCH));
+}
+
+static void update_alive(struct flb_cpu *ctx)
+{
+    if (ctx->pid >= 0 && get_pid_status(ctx->pid)) {
+        ctx->alive = FLB_TRUE;
+    }
+    else {
+        ctx->alive = FLB_FALSE;
+    }
+}
+
+static pid_t get_pid_from_procname_linux(struct flb_cpu *ctx,
+                                         const char* proc)
+{
+    pid_t ret = -1;
+    glob_t glb;
+    int i;
+    int fd = -1;
+    long ret_scan = -1;
+    int ret_glb = -1;
+    ssize_t count;
+
+    char  cmdname[FLB_CMD_LEN];
+    char* bname = NULL;
+
+    ret_glb = glob("/proc/*/cmdline", 0, NULL, &glb);
+    if (ret_glb != 0) {
+        switch(ret_glb){
+        case GLOB_NOSPACE:
+            flb_plg_warn(ctx->ins, "glob: no space");
+            break;
+        case GLOB_NOMATCH:
+            flb_plg_warn(ctx->ins, "glob: no match");
+            break;
+        case GLOB_ABORTED:
+            flb_plg_warn(ctx->ins, "glob: aborted");
+            break;
+        default:
+            flb_plg_warn(ctx->ins, "glob: other error");
+        }
+        return ret;
+    }
+
+    for (i = 0; i < glb.gl_pathc; i++) {
+        fd = open(glb.gl_pathv[i], O_RDONLY);
+        if (fd < 0) {
+            continue;
+        }
+        count = read(fd, &cmdname, FLB_CMD_LEN);
+        if (count <= 0){
+            close(fd);
+            continue;
+        }
+        cmdname[FLB_CMD_LEN-1] = '\0';
+        bname = basename(cmdname);
+
+        if (strncmp(proc, bname, FLB_CMD_LEN) == 0) {
+            sscanf(glb.gl_pathv[i],"/proc/%ld/cmdline",&ret_scan);
+            ret = (pid_t)ret_scan;
+            close(fd);
+            break;
+        }
+        close(fd);
+    }
+    globfree(&glb);
+    return ret;
 }
 
 /* Retrieve CPU load from the system (through ProcFS) */
@@ -428,12 +506,16 @@ static int cpu_collect_pid(struct flb_input_instance *ins,
     msgpack_packer mp_pck;
     msgpack_sbuffer mp_sbuf;
     (void) config;
+    int map_num = 4;
 
     /* Get overall system CPU usage */
     ret = proc_cpu_pid_load(ctx, ctx->pid, cstats);
     if (ret != 0) {
         flb_plg_error(ctx->ins, "error retrieving PID CPU stats");
         return -1;
+    }
+    if (ctx->proc_name != NULL) {
+        map_num++;
     }
 
     s = snapshot_pid_percent(cstats, ctx);
@@ -446,7 +528,20 @@ static int cpu_collect_pid(struct flb_input_instance *ins,
      */
     msgpack_pack_array(&mp_pck, 2);
     flb_pack_time_now(&mp_pck);
-    msgpack_pack_map(&mp_pck, 3);
+    msgpack_pack_map(&mp_pck, map_num);
+
+    /* Proc name */
+    if (ctx->proc_name != NULL) {
+        msgpack_pack_str(&mp_pck, 9);
+        msgpack_pack_str_body(&mp_pck, "proc_name", 9);
+        msgpack_pack_str(&mp_pck, ctx->len_proc_name);
+        msgpack_pack_str_body(&mp_pck, ctx->proc_name, ctx->len_proc_name);
+    }
+
+    /* PID */
+    msgpack_pack_str(&mp_pck, 3);
+    msgpack_pack_str_body(&mp_pck, "pid", 3);
+    msgpack_pack_int64(&mp_pck, ctx->pid);
 
     /* All CPU */
     msgpack_pack_str(&mp_pck, 5);
@@ -477,9 +572,31 @@ static int cb_cpu_collect(struct flb_input_instance *ins,
                           struct flb_config *config, void *in_context)
 {
     struct flb_cpu *ctx = in_context;
+    uint8_t was_alive;
+    int ret;
 
-    /* if a PID is get, get CPU stats only for that process */
-    if (ctx->pid >= 0) {
+    /* if a PID or process name is get, get CPU stats only for that process */
+    if (ctx->proc_name != NULL) {
+        /* refresh PID and ensure that cpu data are initialized */
+        ctx->pid = get_pid_from_procname_linux(ctx, ctx->proc_name);
+        /* if the process name did not yield a PID, do not emit a record */
+        if (ctx->pid < 0) {
+            flb_plg_trace(ctx->ins, "Process '%s' not running", ctx->proc_name);
+            return 0;
+        }
+        was_alive = ctx->alive;
+        update_alive(ctx);
+        if (!was_alive && ctx->alive) {
+            ret = proc_cpu_pid_load(ctx, ctx->pid, &ctx->cstats);
+            if (ret != 0) {
+                flb_error("[cpu] Could not obtain CPU data for '%s'", ctx->proc_name);
+                return -1;
+            }
+            snapshots_switch(&ctx->cstats);
+        }
+        return cpu_collect_pid(ins, config, in_context);
+    }
+    else if (ctx->pid >= 0) {
         return cpu_collect_pid(ins, config, in_context);
     }
     else {
@@ -518,6 +635,18 @@ static int cb_cpu_init(struct flb_input_instance *in,
         ctx->pid = -1;
     }
 
+    /* Process name */
+    pval = flb_input_get_property("proc_name", in);
+    if (pval) {
+        ctx->proc_name = (char*)flb_malloc(FLB_CMD_LEN);
+        if (ctx->proc_name == NULL) {
+            return -1;
+        }
+        strncpy(ctx->proc_name, pval, FLB_CMD_LEN);
+        ctx->proc_name[FLB_CMD_LEN-1] = '\0';
+        ctx->len_proc_name = strlen(ctx->proc_name);
+    }
+
     /* Collection time setting */
     pval = flb_input_get_property("interval_sec", in);
     if (pval != NULL && atoi(pval) >= 0) {
@@ -549,7 +678,17 @@ static int cb_cpu_init(struct flb_input_instance *in,
     }
 
     /* Get CPU load, ready to be updated once fired the calc callback */
-    if (ctx->pid > 0) {
+    if (ctx->proc_name != NULL) {
+        ctx->pid = get_pid_from_procname_linux(ctx, ctx->proc_name);
+        update_alive(ctx);
+        if (ctx->alive) {
+            ret = proc_cpu_pid_load(ctx, ctx->pid, &ctx->cstats);
+        }
+        else {
+            ret = 0;
+        }
+    }
+    else if (ctx->pid > 0) {
         ret = proc_cpu_pid_load(ctx, ctx->pid, &ctx->cstats);
     }
     else {
@@ -605,6 +744,9 @@ static int cb_cpu_exit(void *data, struct flb_config *config)
     flb_free(cs->snap_b);
 
     /* done */
+    if (ctx->proc_name != NULL) {
+        flb_free(ctx->proc_name);
+    }
     flb_free(ctx);
 
     return 0;
